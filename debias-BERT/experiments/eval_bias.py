@@ -2,6 +2,7 @@ from __future__ import absolute_import, division, print_function
 import numpy as np
 import json
 import os
+import glob
 import logging
 import argparse
 from scipy import spatial
@@ -14,6 +15,7 @@ import pickle
 # word embeddings
 import gensim
 import gensim.downloader as api
+from run_classifier import extract_embeddings, compute_religion_dir, get_tokenizer_encoder
 from gensim.utils import tokenize
 from eval_utils import isInSet
 
@@ -21,7 +23,6 @@ from eval_utils import isInSet
 import weat
 from run_classifier import get_encodings, compute_gender_dir, get_tokenizer_encoder
 from run_classifier import get_def_examples
-from experiments.def_sent_utils import get_all, get_all_domains, get_def_pairs
 from my_debiaswe import my_we
 
 logger = logging.getLogger(__name__)
@@ -36,14 +37,14 @@ DEVICE = torch.device("cuda") if torch.cuda.is_available() else None
 
 
 def load_json(sent_file):
-    ''' Load from json. We expect a certain format later, so do some post processing '''
-    logger.info("Loading %s..." % sent_file)
-    all_data = json.load(open(sent_file, 'r'))
-    data = {}
-    for k, v in all_data.items():
-        examples = v["examples"]
-        data[k] = examples
-    return all_data  # data
+	''' Load from json. We expect a certain format later, so do some post processing '''
+	logger.info("Loading %s..." % sent_file)
+	all_data = json.load(open(sent_file, 'r'))
+	data = {}
+	for k, v in all_data.items():
+		examples = v["examples"]
+		data[k] = examples
+	return all_data  # data
 
 
 def parse_args():
@@ -120,7 +121,7 @@ def _binary_s(target, attributes):
 	for aj in attributes[1]:
 		groupTwo.append(spatial.distance.cosine(target, aj))
 	return sum(groupOne)/float(len(groupOne)) - sum(groupTwo)/float(len(groupTwo))
-	
+
 
 def save_dict_to_json(D, output_eval_file):
 	with open(output_eval_file, 'w') as f:
@@ -137,13 +138,56 @@ def run_binary_weat_test(encs):
 	weat_score, effect_size = binary_weat(targets, attributes)
 	return weat_score, effect_size
 
+def _unary_s(embeddings, target, attributes):
+	return np.mean([ spatial.distance.cosine(embeddings[target], embeddings[ai]) for ai in attributes ])
+
+
+def multiclass_evaluation(embeddings, targets, attributes):
+	targets_eval = []
+	for targetSet in targets:
+		for target in targetSet:
+			for attributeSet in attributes:
+				targets_eval.append(_unary_s(embeddings, target, attributeSet))
+	m_score = np.mean(targets_eval)
+	return m_score, targets_eval
+
+def evaluate_religion(args, target_sentences, eval_sentences, attr_sentences, max_seq_length=128, debiased=True):
+	religion_subspace = None
+	tokenizer, bert_encoder = get_tokenizer_encoder(args, DEVICE)
+	print("tokenizer: {}".format(tokenizer==None))
+
+
+	if debiased:
+		religion_subspace = compute_religion_dir(DEVICE, tokenizer, bert_encoder, target_sentences,
+			args.max_seq_length, k=args.num_dimension)
+	eval_sentences_exist = glob.glob("eval_sentences.pkl")
+	if len(eval_sentences_exist):
+		eval_sentences_encs = pickle.load(open("eval_sentences.pkl", "rb"))
+		attr_sentences_encs = pickle.load(open("attr_sentences.pkl", "rb"))
+	else:
+		eval_sentences_encs = extract_embeddings(bert_encoder, tokenizer, eval_sentences, max_seq_length)
+		attr_sentences_encs = extract_embeddings(bert_encoder, tokenizer, attr_sentences, max_seq_length)
+		pickle.dump(eval_sentences_encs, open("eval_sentences.pkl", "wb"))
+		pickle.dump(attr_sentences_encs, open("attrx_sentences.pkl", "wb"))
+	eval_sentences_flatten = [x for y in eval_sentences for x in y]
+	attr_sentences_flatten = [x for y in attr_sentences for x in y]
+	import pdb;
+	pdb.set_trace()
+	eval_sentences_encs = make_dict(eval_senten	ces_encs, eval_sentences_flatten)
+	attr_sentences_encs = make_dict(attr_sentences_encs, attr_sentences_flatten)
+	embeddings = eval_sentences_encs
+	embeddings.update(attr_sentences_encs)
+	return multiclass_evaluation(embeddings, eval_sentences[:10], attr_sentences)
+
+def make_dict(embeddings, sentences):
+	return {sentences[i]: embeddings[i] for i in range(len(sentences))}
 
 def evaluate(args, def_pairs, word_level=False):
 	'''Evaluate bias level with given definitional sentence pairs.'''
 	results_path = os.path.join(args.results_dir, args.output_name)
 
 	if (not args.encode_only):
-		if (os.path.exists(results_path)): 
+		if (os.path.exists(results_path)):
 			print("Results already evaluated in {}".format(results_path))
 			return
 		if (not os.path.exists(args.results_dir)): os.makedirs(args.results_dir)
@@ -155,7 +199,7 @@ def evaluate(args, def_pairs, word_level=False):
 	print("tokenizer: {}".format(tokenizer==None))
 	gender_subspace = None
 	if (args.debias):
-		gender_subspace = compute_gender_dir(DEVICE, tokenizer, bert_encoder, def_pairs, 
+		gender_subspace = compute_gender_dir(DEVICE, tokenizer, bert_encoder, def_pairs,
 			args.max_seq_length, k=args.num_dimension, load=True, task=args.model, word_level=word_level, keepdims=True)
 		logger.info("Computed (gender) bias direction")
 
@@ -169,7 +213,7 @@ def evaluate(args, def_pairs, word_level=False):
 		sent_file = os.path.join(DATA_DIR, filename)
 		data = load_json(sent_file)
 
-		encs = get_encodings(args, data, tokenizer, bert_encoder, gender_subspace, 
+		encs = get_encodings(args, data, tokenizer, bert_encoder, gender_subspace,
 			DEVICE, word_level=word_level, specific_set=specific_set)
 		if (args.encode_only):
 			if (args.debias):
@@ -182,9 +226,9 @@ def evaluate(args, def_pairs, word_level=False):
 			continue
 		'''
 		encs: targ1, targ2, attr1, attr2
-		         -> category
-		         -> encs
-		         	-> (id1, sent1_emb), (id2, sent2_emb), ...
+				 -> category
+				 -> encs
+					-> (id1, sent1_emb), (id2, sent2_emb), ...
 		'''
 
 		esize, pval = weat.run_test(encs, n_samples=args.n_samples, parametric=args.parametric)
@@ -194,24 +238,35 @@ def evaluate(args, def_pairs, word_level=False):
 		print(filename, result)
 		results.append(result)
 		test_results = {"esize": esize, "pval": pval}
-		
+
 		all_tests_dict[filename] = test_results
 	avg_absesize = np.mean(np.array(abs_esizes))
 	print("Averge of Absolute esize: {}".format(avg_absesize))
 	all_tests_dict['avg_absesize'] = avg_absesize
 
 	if (args.encode_only): return
-	
+
 	# print and save results
 	for result in results: logger.info(result)
 	save_dict_to_json(all_tests_dict, results_path)
 
 	return
 
+def get_def_pairs_religion(path):
+	sent_templates = json.load(open(path, "rb"))
+	return [sent_templates["targ1"]["examples"]]
+
+def get_attributes(path):
+	sent_templates = json.load(open(path, "rb"))
+	attributes = []
+	for x, k in sent_templates.items():
+		if "attr" in x:
+			attributes.append(k["examples"])
+	return attributes
 
 def eval_sent_debias():
 	'''
-	Evaluate bias level using definitional sentences 
+	Evaluate bias level using definitional sentences
 	specified in args.
 	'''
 	args = parse_args()
@@ -220,12 +275,12 @@ def eval_sent_debias():
 	accdomain_prefix = "accdomain"
 	domain_prefix = "moredomain"
 	if (def_pairs_name.startswith(size_prefix)):
-		# evaluate model 
+		# evaluate model
 		bucket_list = get_single_domain_in_buckets()
 		indices = np.arange(len(bucket_list))
 
 		size = int(def_pairs_name[len(size_prefix):])
-		
+
 		choices_list = list(combinations(indices, size))
 		logger.info(choices_list)
 		for choices in choices_list:
@@ -259,12 +314,19 @@ def eval_sent_debias():
 		domain_size = int(fixed_size / size)
 		logger.info("{} samples per domain; domain: {}".format(domain_size, choices_list))
 		domain_list = get_all_domains(domain_size)
-		for choices in choices_list: 
+		for choices in choices_list:
 			logger.info(choices)
 			chosen_buckets = [domain_list[i] for i in choices]
 			def_pairs = []
 			for bucket in chosen_buckets: def_pairs += bucket
 			evaluate(args, def_pairs)
+	elif def_pairs_name == "religion":
+		target_sentences = get_def_pairs_religion("religion_tests/sent-test_%s.jsonl" % args.def_pairs_name)
+		eval_sentences = get_def_pairs_religion("religion_tests/sent-test_%s.jsonl" % args.def_pairs_name)
+		attr_sentences = get_attributes("religion_tests/sent-test_%s.jsonl" % args.def_pairs_name)
+		import pdb; pdb.set_trace()
+		evaluate_religion(args, target_sentences, eval_sentences, attr_sentences, debiased=False)
+
 	else:
 		def_pairs = get_def_pairs(def_pairs_name)
 		evaluate(args, def_pairs)
@@ -288,7 +350,7 @@ class WordEvaluator(object):
 
 		self.vocab = self.init_vocab() # 190 words
 		self.expand_specific_vocab()
-		
+
 		self.E = my_we.WordEmbedding(args.word_model, self.vocab)
 		if (args.debias): self.debias()
 
@@ -328,13 +390,13 @@ class WordEvaluator(object):
 		self.definitional = definitional
 		self.equalize = equalize
 		self.gender_specific_words = gender_specific_words
-		
+
 		return vocab
 
 	# expanding gender_specific_full to gender_specific_complete
 	# with gender specific words from tests.
 	def expand_specific_vocab(self):
-		# expand gender specific words 
+		# expand gender specific words
 		gender_specific_words = set(self.gender_specific_words)
 		for word_filename in self.word_filenames:
 			word_file = os.path.join(DATA_DIR, word_filename)
@@ -421,7 +483,7 @@ class WordEvaluator(object):
 			print(filename, result)
 			results.append(result)
 			test_results = {"esize": esize, "pval": pval}
-			
+
 			all_tests_dict[filename] = test_results
 
 		# print and save results

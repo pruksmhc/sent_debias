@@ -228,11 +228,11 @@ class BertEncoder(object):
 		return embeddings
 
 
-def extract_embeddings(bert_encoder, tokenizer, examples, max_seq_length, device, 
-		label_list, output_mode, norm, word_level=False):
+def extract_embeddings(bert_encoder, tokenizer, examples, max_seq_length, device=None):
 	'''Encode examples into BERT embeddings in batches.'''
-	features = convert_examples_to_dualfeatures(
-		examples, label_list, max_seq_length, tokenizer, output_mode)
+	# flatten examples
+	examples = [x for y in examples for x in y]
+	features = convert_examples_to_dualfeatures(examples,  max_seq_length, tokenizer)
 	all_inputs_a = torch.tensor([f.input_ids_a for f in features], dtype=torch.long)
 	all_mask_a = torch.tensor([f.mask_a for f in features], dtype=torch.long)
 	all_segments_a = torch.tensor([f.segments_a for f in features], dtype=torch.long)
@@ -253,7 +253,73 @@ def extract_embeddings(bert_encoder, tokenizer, examples, max_seq_length, device
 	return all_embeddings
 
 
+
 def extract_embeddings_pair(bert_encoder, tokenizer, examples, max_seq_length, device, 
+		load, task, label_list, output_mode, norm, word_level=False):
+	'''Encode paired examples into BERT embeddings in batches.
+	   Used in the computation of gender bias direction.
+	   Save computed embeddings under saved_embs/.
+	'''
+	emb_loc_a = 'saved_embs/num%d_a_%s.pkl' % (len(examples), task)
+	emb_loc_b = 'saved_embs/num%d_b_%s.pkl' % (len(examples), task)
+	if os.path.isfile(emb_loc_a) and os.path.isfile(emb_loc_b) and load:
+		with open(emb_loc_a, 'rb') as f:
+			all_embeddings_a = pickle.load(f)
+		with open(emb_loc_b, 'rb') as f:
+			all_embeddings_b = pickle.load(f)
+		print ('preprocessed embeddings loaded from:', emb_loc_a, emb_loc_b)
+	else:
+		features = convert_examples(
+			examples, label_list, max_seq_length, tokenizer, output_mode)
+		all_inputs_a = torch.tensor([f.input_ids_a for f in features], dtype=torch.long)
+		all_mask_a = torch.tensor([f.mask_a for f in features], dtype=torch.long)
+		all_segments_a = torch.tensor([f.segments_a for f in features], dtype=torch.long)
+		all_inputs_b = torch.tensor([f.input_ids_b for f in features], dtype=torch.long)
+		all_mask_b = torch.tensor([f.mask_b for f in features], dtype=torch.long)
+		all_segments_b = torch.tensor([f.segments_b for f in features], dtype=torch.long)
+
+		data = TensorDataset(all_inputs_a, all_inputs_b, all_mask_a, all_mask_b, all_segments_a, all_segments_b)
+		dataloader = DataLoader(data, batch_size=32, shuffle=False)
+		all_embeddings_a = []
+		all_embeddings_b = []
+		for step, batch in enumerate(tqdm(dataloader)):
+			inputs_a, inputs_b, mask_a, mask_b, segments_a, segments_b = batch
+			if (device != None):
+				inputs_a = inputs_a.to(device)
+				mask_a = mask_a.to(device)
+				segments_a = segments_a.to(device)
+				inputs_b = inputs_b.to(device)
+				mask_b = mask_b.to(device)
+				segments_b = segments_b.to(device)
+			embeddings_a = bert_encoder.encode(input_ids=inputs_a, token_type_ids=segments_a, attention_mask=mask_a, word_level=False)
+			embeddings_b = bert_encoder.encode(input_ids=inputs_b, token_type_ids=segments_b, attention_mask=mask_b, word_level=False)
+
+			embeddings_a /= torch.norm(embeddings_a, dim=-1, keepdim=True)
+			embeddings_b /= torch.norm(embeddings_b, dim=-1, keepdim=True)
+			if not torch.isnan(embeddings_a).any() and not torch.isnan(embeddings_b).any():
+				embeddings_a = embeddings_a.cpu().detach().numpy()
+				embeddings_b = embeddings_b.cpu().detach().numpy()
+				all_embeddings_a.append(embeddings_a)
+				all_embeddings_b.append(embeddings_b)
+
+		all_embeddings_a = np.concatenate(all_embeddings_a, axis=0)
+		all_embeddings_b = np.concatenate(all_embeddings_b, axis=0)
+
+		with open(emb_loc_a, 'wb') as f:
+			pickle.dump(all_embeddings_a, f)
+		with open(emb_loc_b, 'wb') as f:
+			pickle.dump(all_embeddings_b, f)
+
+		print ('preprocessed embeddings saved to:', emb_loc_a, emb_loc_b)
+
+	means = (all_embeddings_a + all_embeddings_b) / 2.0
+	all_embeddings_a -= means
+	all_embeddings_b -= means
+	all_embeddings = np.concatenate([all_embeddings_a, all_embeddings_b], axis=0)
+	return all_embeddings
+
+
+def extract_embeddings_general(bert_encoder, tokenizer, examples, max_seq_length, device,
 		load, task, label_list, output_mode, norm, word_level=False):
 	'''Encode paired examples into BERT embeddings in batches.
 	   Used in the computation of gender bias direction.
@@ -317,7 +383,6 @@ def extract_embeddings_pair(bert_encoder, tokenizer, examples, max_seq_length, d
 	all_embeddings = np.concatenate([all_embeddings_a, all_embeddings_b], axis=0)
 	return all_embeddings
 
-
 def doPCA(matrix, num_components=10):
 	pca = PCA(n_components=num_components, svd_solver="auto")
 	pca.fit(matrix) # Produce different results each time...
@@ -336,6 +401,19 @@ def get_def_examples(def_pairs):
 				text_a=sent_a, text_b=sent_b, label=None))
 	return def_examples
 
+def compute_religion_dir(device, tokenizer, bert_encoder, def_pairs, max_seq_length, k):
+	'''Compute gender bias direction from definitional sentence pairs.'''
+	import glob
+	religion_exists = glob.glob("religion_embeddings.pkl")
+	if len(religion_exists):
+		all_embeddings = pickle.load(open("religion_embeddings.pkl", "rb"))
+	else:
+		all_embeddings = extract_embeddings(bert_encoder, tokenizer, def_pairs, max_seq_length, device)
+		pickle.dump(all_embeddings, open("religion_embeddings.pkl", "wb"))
+	religion_dir = doPCA(all_embeddings).components_[:k]
+	logger.info("religion direction={} {} {}".format(religion_dir.shape,
+			type(religion_dir), religion_dir[:10]))
+	return religion_dir
 
 def compute_gender_dir(device, tokenizer, bert_encoder, def_pairs, max_seq_length, k, load, task, word_level=False, keepdims=False):
 	'''Compute gender bias direction from definitional sentence pairs.'''
@@ -455,7 +533,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
 	return features
 
 
-def convert_examples_to_dualfeatures(examples, label_list, max_seq_length, tokenizer, output_mode):
+def convert_examples_to_dualfeatures(examples, max_seq_length, tokenizer):
 	"""Loads a data file into a list of dual input features."""
 	'''
 	output_mode: classification or regression
@@ -465,7 +543,7 @@ def convert_examples_to_dualfeatures(examples, label_list, max_seq_length, token
 		if ex_index % 10000 == 0:
 			logger.info("Writing example %d of %d" % (ex_index, len(examples)))
 
-		tokens_a = tokenizer.tokenize(example.text_a)
+		tokens_a = tokenizer.tokenize(example)
 		# truncate length
 		if len(tokens_a) > max_seq_length - 2:
 			tokens_a = tokens_a[:(max_seq_length - 2)]
@@ -482,26 +560,9 @@ def convert_examples_to_dualfeatures(examples, label_list, max_seq_length, token
 		assert(len(mask_a) == max_seq_length)
 		assert(len(segments_a) == max_seq_length)
 
-		if example.text_b:
-			tokens_b = tokenizer.tokenize(example.text_b)
-			if len(tokens_b) > max_seq_length - 2:
-				tokens_b = tokens_b[:(max_seq_length - 2)]
-
-			tokens_b = ["[CLS]"] + tokens_b + ["[SEP]"]
-			segments_b = [0] * len(tokens_b)
-			input_ids_b = tokenizer.convert_tokens_to_ids(tokens_b)
-			mask_b = [1] * len(input_ids_b)
-			padding_b = [0] * (max_seq_length - len(input_ids_b))
-			input_ids_b += padding_b
-			mask_b += padding_b
-			segments_b += padding_b
-			assert(len(input_ids_b) == max_seq_length)
-			assert(len(mask_b) == max_seq_length)
-			assert(len(segments_b) == max_seq_length)
-		else:
-			input_ids_b = None
-			mask_b = None
-			segments_b = None
+		input_ids_b = None
+		mask_b = None
+		segments_b = None
 
 		features.append(
 				DualInputFeatures(input_ids_a=input_ids_a,
@@ -687,8 +748,9 @@ def get_tokenizer_encoder(args, device=None):
 	return tokenizer, bert_encoder
 
 
-def get_encodings(args, encs, tokenizer, bert_encoder, gender_space, device, 
-		word_level=False, specific_set=None):
+
+def get_encodings(args, encs, tokenizer, bert_encoder, gender_space, device, max_seq_len,
+		word_level=False, specific_set=None, debias=False):
 	'''Extract BERT embeddings from encodings dictionary.
 	   Perform the debiasing step if debias is specified in args.
 	'''
@@ -696,22 +758,17 @@ def get_encodings(args, encs, tokenizer, bert_encoder, gender_space, device,
 
 	logger.info("Get encodings")
 	logger.info("Debias={}".format(args.debias))
-
-	examples_dict = dict()
-	for key in ['targ1', 'targ2', 'attr1', 'attr2']:
-		texts = encs[key]['examples']
-		category = encs[key]['category'].lower()
-		examples = []
-		encs[key]['text_ids'] = dict()
-		for i, text in enumerate(texts):
-			examples.append(InputExample(guid='{}'.format(i), text_a=text, text_b=None, label=None))
-			encs[key]['text_ids'][i] = text
-		examples_dict[key] = examples
-		all_embeddings = extract_embeddings(bert_encoder, tokenizer, examples, args.max_seq_length, device, 
-					label_list=None, output_mode=None, norm=False, word_level=word_level)
-
-		logger.info("Debias category {}".format(category))
-
+	import pdb; pdb.set_trace()
+	encs = [["[CLS]" ]+ tokenizer.tokenize(enc) +["[SEP]"] for enc in encs]
+	final_encs = []
+	for enc in encs:
+		if len(enc) > max_seq_len:
+			final_encs.append(enc[:max_seq_len])
+		else:
+			final_encs.append(enc)
+	encs = [tokenizer.convert_tokens_to_ids(enc) for enc in encs]
+	output = bert_encoder(input_ids, attention_mask=attention_mask)
+	"""
 		emb_dict = {}
 		for index, emb in enumerate(all_embeddings):
 			emb /= np.linalg.norm(emb)
@@ -721,6 +778,7 @@ def get_encodings(args, encs, tokenizer, bert_encoder, gender_space, device,
 			emb_dict[index] = emb
 
 		encs[key]['encs'] = emb_dict
+	"""
 	return encs
 
 
