@@ -11,11 +11,12 @@ import itertools
 from itertools import combinations
 import collections
 import pickle
+from scipy.stats import ttest_rel, spearmanr
 
 # word embeddings
 import gensim
 import gensim.downloader as api
-from run_classifier import extract_embeddings, compute_religion_dir, get_tokenizer_encoder
+from run_classifier import extract_embeddings, extract_embeddings_religion, compute_religion_dir, get_tokenizer_encoder
 from gensim.utils import tokenize
 from eval_utils import isInSet
 
@@ -24,6 +25,7 @@ import weat
 from run_classifier import get_encodings, compute_gender_dir, get_tokenizer_encoder
 from run_classifier import get_def_examples
 from my_debiaswe import my_we
+from def_sent_utils import get_def_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -160,20 +162,18 @@ def evaluate_religion(args, target_sentences, eval_sentences, attr_sentences, ma
 	if debiased:
 		religion_subspace = compute_religion_dir(DEVICE, tokenizer, bert_encoder, target_sentences,
 			args.max_seq_length, k=args.num_dimension)
-	eval_sentences_exist = glob.glob("eval_sentences.pkl")
+	eval_sentences_exist = glob.glob("eval_sentences_%s.pkl" % debiased)
 	if len(eval_sentences_exist):
-		eval_sentences_encs = pickle.load(open("eval_sentences.pkl", "rb"))
-		attr_sentences_encs = pickle.load(open("attr_sentences.pkl", "rb"))
+		eval_sentences_encs = pickle.load(open("eval_sentences_%s.pkl" % debiased, "rb"))
+		attr_sentences_encs = pickle.load(open("attr_sentences_%s.pkl" % debiased, "rb"))
 	else:
-		eval_sentences_encs = extract_embeddings(bert_encoder, tokenizer, eval_sentences, max_seq_length)
-		attr_sentences_encs = extract_embeddings(bert_encoder, tokenizer, attr_sentences, max_seq_length)
-		pickle.dump(eval_sentences_encs, open("eval_sentences.pkl", "wb"))
-		pickle.dump(attr_sentences_encs, open("attrx_sentences.pkl", "wb"))
+		eval_sentences_encs = extract_embeddings_religion(bert_encoder, tokenizer, eval_sentences, max_seq_length, religion_subspace=religion_subspace)
+		attr_sentences_encs = extract_embeddings_religion(bert_encoder, tokenizer, attr_sentences, max_seq_length, religion_subspace=religion_subspace)
+		pickle.dump(eval_sentences_encs, open("eval_sentences_%s.pkl" % debiased, "wb"))
+		pickle.dump(attr_sentences_encs, open("attr_sentences_%s.pkl" % debiased, "wb"))
 	eval_sentences_flatten = [x for y in eval_sentences for x in y]
 	attr_sentences_flatten = [x for y in attr_sentences for x in y]
-	import pdb;
-	pdb.set_trace()
-	eval_sentences_encs = make_dict(eval_senten	ces_encs, eval_sentences_flatten)
+	eval_sentences_encs = make_dict(eval_sentences_encs, eval_sentences_flatten)
 	attr_sentences_encs = make_dict(attr_sentences_encs, attr_sentences_flatten)
 	embeddings = eval_sentences_encs
 	embeddings.update(attr_sentences_encs)
@@ -194,15 +194,19 @@ def evaluate(args, def_pairs, word_level=False):
 
 	results = []
 	all_tests_dict = dict()
-
+	import pdb; pdb.set_trace()
+	def_pairs = {2: def_pairs[2]}
+	def_pairs[2]["f"] = [def_pairs[2]["f"][0]]
+	def_pairs[2]["m"] = [def_pairs[2]["m"][0]]
 	tokenizer, bert_encoder = get_tokenizer_encoder(args, DEVICE)
 	print("tokenizer: {}".format(tokenizer==None))
 	gender_subspace = None
+
 	if (args.debias):
 		gender_subspace = compute_gender_dir(DEVICE, tokenizer, bert_encoder, def_pairs,
 			args.max_seq_length, k=args.num_dimension, load=True, task=args.model, word_level=word_level, keepdims=True)
 		logger.info("Computed (gender) bias direction")
-
+	import pdb; pdb.set_trace()
 	with open(args.gendered_words_filename, "r") as f:
 		gender_specific_words = json.load(f)
 	specific_set = set(gender_specific_words)
@@ -251,6 +255,7 @@ def evaluate(args, def_pairs, word_level=False):
 	save_dict_to_json(all_tests_dict, results_path)
 
 	return
+
 
 def get_def_pairs_religion(path):
 	sent_templates = json.load(open(path, "rb"))
@@ -324,9 +329,13 @@ def eval_sent_debias():
 		target_sentences = get_def_pairs_religion("religion_tests/sent-test_%s.jsonl" % args.def_pairs_name)
 		eval_sentences = get_def_pairs_religion("religion_tests/sent-test_%s.jsonl" % args.def_pairs_name)
 		attr_sentences = get_attributes("religion_tests/sent-test_%s.jsonl" % args.def_pairs_name)
+		biased_MAC, biased_dist = evaluate_religion(args, target_sentences, eval_sentences, attr_sentences, debiased=False)
+		debiased_MAC, debiased_dist = evaluate_religion(args, target_sentences, eval_sentences, attr_sentences, debiased=True)
+		statistics, pvalue = ttest_rel(biased_dist, debiased_dist)
+		print("Biased MAC is %s" % biased_MAC)
+		print("Debiased %s" % debiased_MAC)
+		print("HARD Debiased Cosine difference t-test", pvalue)
 		import pdb; pdb.set_trace()
-		evaluate_religion(args, target_sentences, eval_sentences, attr_sentences, debiased=False)
-
 	else:
 		def_pairs = get_def_pairs(def_pairs_name)
 		evaluate(args, def_pairs)

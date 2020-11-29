@@ -241,6 +241,7 @@ def drop(u, v):
 
 
 def dropspace(u, V):
+	# V should be [k, word_dim], and u should be [word_dim, 1] here.
 	norm_sqrd = np.sum(V*V, axis=-1)
 	vecs = np.divide(V@u, norm_sqrd)[:, None] * V
 	subspace = np.sum(vecs, axis=0)
